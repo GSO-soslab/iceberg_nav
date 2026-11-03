@@ -26,9 +26,14 @@ struct VoxelKey {
 
 struct KeyHash {
     std::size_t operator()(const VoxelKey &k) const {
-        return ((std::hash<int>()(k.x) ^
-                (std::hash<int>()(k.y) << 1)) >> 1) ^
-               (std::hash<int>()(k.z) << 1);
+        // Pack the three indices (each < 2^21) into 64 bits, then mix (splitmix64 finalizer)
+        uint64_t h = (static_cast<uint64_t>(static_cast<uint32_t>(k.x)) & 0x1FFFFF)
+                   | ((static_cast<uint64_t>(static_cast<uint32_t>(k.y)) & 0x1FFFFF) << 21)
+                   | ((static_cast<uint64_t>(static_cast<uint32_t>(k.z)) & 0x1FFFFF) << 42);
+        h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+        return static_cast<std::size_t>(h);
     }
 };
     
@@ -105,6 +110,8 @@ public:
         this->declare_parameter<double>("map_publish_rate", 5.0);
         this->get_parameter("map_publish_rate", map_publish_rate_);
 
+        // prob >= thr  <=>  logodds >= logit(thr); avoids an exp() per voxel per publish
+        logodds_threshold_ = to_logodds(prob_threshold_);
         n_voxels_ = static_cast<int>(std::ceil(global_costmap_dim_ / voxel_res_));
         half_grid_ = global_costmap_dim_ / 2.0;
     }
@@ -181,6 +188,8 @@ private:
     // --- Voxel map ---
     double voxel_res_, logodds_min_, logodds_max_;
     double prob_threshold_;
+    double logodds_threshold_{0.0};
+    size_t last_occ_count_{0};
     double half_grid_;
     int n_voxels_;
     std::unordered_map<VoxelKey, double, KeyHash> logodds_grid_;
@@ -322,6 +331,8 @@ private:
         // Transform points to map frame using TF
         Eigen::Matrix4f T = transformToMatrix(trans);
 
+        const rclcpp::Time now = decay_time_ > 0.0 ? this->get_clock()->now() : rclcpp::Time(0, 0, RCL_ROS_TIME);
+
         std::lock_guard<std::mutex> lock(map_mutex_);
         for (size_t i = 0; i < points.size(); i++) {
             Eigen::Vector4f p_map = T * points[i];
@@ -336,57 +347,59 @@ private:
 
             VoxelKey key{ix, iy, iz};
             
-            // Bayesian log-odds update
-            double logodds_measurement = to_logodds(sensor_model_prob[i]);
-            double logodds_prior = to_logodds(0.5);
-            double evidence = logodds_measurement - logodds_prior;
-            
-            if (logodds_grid_.find(key) != logodds_grid_.end()) {
-                logodds_grid_[key] += evidence;
-            } else {
-                logodds_grid_[key] = evidence;
-            }
+            // Bayesian log-odds update (prior 0.5 -> logodds 0, so evidence = logit(p))
+            const double evidence = to_logodds(sensor_model_prob[i]);
 
-            // Clip
-            logodds_grid_[key] = std::min(std::max(logodds_grid_[key], logodds_min_), logodds_max_);
+            // Single hash lookup; new voxels start at the 0 prior
+            double& lo = logodds_grid_.try_emplace(key, 0.0).first->second;
+            lo = std::min(std::max(lo + evidence, logodds_min_), logodds_max_);
 
             if (decay_time_ > 0.0) {
-                last_seen_[key] = this->get_clock()->now();
+                last_seen_[key] = now;
             }
 
         }
 
     }
 
+    struct OccVoxel {
+        VoxelKey key;
+        double logodds;
+    };
+
+    // Snapshot occupied voxels under the lock (single pass, no exp), then build
+    // all messages outside the lock so sensor callbacks are not starved.
     void publishAll() {
-        publishVoxelMap();
-        publishGlobalCostmap();
-        publishLocalCostmap();
-    }
-
-    void publishVoxelMap() {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        // Count valid voxels
-        size_t num_voxels = 0;
-        for (const auto& kv : logodds_grid_) {
-            double prob = to_prob(kv.second);
-            if (prob >= prob_threshold_) {
-                num_voxels++;
+        std::vector<OccVoxel> occ;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            occ.reserve(last_occ_count_);
+            for (const auto& kv : logodds_grid_) {
+                if (kv.second >= logodds_threshold_) {
+                    occ.push_back({kv.first, kv.second});
+                }
             }
+            last_occ_count_ = occ.size();
         }
 
+        const auto stamp = this->get_clock()->now();
+        publishVoxelMap(occ, stamp);
+        publishGlobalCostmap(occ, stamp);
+        publishLocalCostmap(occ, stamp);
+    }
+
+    void publishVoxelMap(const std::vector<OccVoxel>& occ, const rclcpp::Time& stamp) {
+        const size_t num_voxels = occ.size();
         if (num_voxels == 0) return;
 
-        // Create PointCloud2 message
         sensor_msgs::msg::PointCloud2 cloud_msg;
-        cloud_msg.header.stamp = this->get_clock()->now();
+        cloud_msg.header.stamp = stamp;
         cloud_msg.header.frame_id = frame_id_;
         cloud_msg.height = 1;
         cloud_msg.width = num_voxels;
         cloud_msg.is_dense = true;
         cloud_msg.is_bigendian = false;
 
-        // // Define fields: x, y, z, intensity
         sensor_msgs::PointCloud2Modifier modifier(cloud_msg);
         modifier.setPointCloud2Fields(4,
             "x", 1, sensor_msgs::msg::PointField::FLOAT32,
@@ -394,39 +407,19 @@ private:
             "z", 1, sensor_msgs::msg::PointField::FLOAT32,
             "intensity", 1, sensor_msgs::msg::PointField::FLOAT32
         );
-        
         modifier.resize(num_voxels);
-        
-        cloud_msg.point_step = 16;  // 12 (xyz) + 4 (intensity)
-        cloud_msg.row_step = cloud_msg.point_step * num_voxels;
-        cloud_msg.data.resize(cloud_msg.row_step);
 
-        // Create iterators
         sensor_msgs::PointCloud2Iterator<float> iter_x(cloud_msg, "x");
         sensor_msgs::PointCloud2Iterator<float> iter_y(cloud_msg, "y");
         sensor_msgs::PointCloud2Iterator<float> iter_z(cloud_msg, "z");
         sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud_msg, "intensity");
 
-        // Fill point cloud data
-        for (const auto& kv : logodds_grid_) {
-            const VoxelKey& key = kv.first;
-            double logodds = kv.second;
-            double prob = to_prob(logodds);
-
-            if (prob < prob_threshold_) continue;
-
-            // Calculate voxel center in world coordinates
-            *iter_x = key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
-            *iter_y = key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
-            *iter_z = key.z * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
-
-            // Set intensity as probability (0-1 range)
-            *iter_intensity = static_cast<float>(prob);
-
-            ++iter_x;
-            ++iter_y;
-            ++iter_z;
-            ++iter_intensity;
+        for (const auto& v : occ) {
+            *iter_x = v.key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            *iter_y = v.key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            *iter_z = v.key.z * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            *iter_intensity = static_cast<float>(to_prob(v.logodds));
+            ++iter_x; ++iter_y; ++iter_z; ++iter_intensity;
         }
 
         prob_cloud_pub_->publish(cloud_msg);
@@ -445,13 +438,12 @@ private:
         return z_world <= z_cutoff_ && z_world >= depth_lo && z_world <= depth_hi;
     }
 
-    void publishGlobalCostmap() {
-        std::lock_guard<std::mutex> lock(map_mutex_);
+    void publishGlobalCostmap(const std::vector<OccVoxel>& occ, const rclcpp::Time& stamp) {
         const int cells = static_cast<int>(std::ceil(global_costmap_dim_ / voxel_res_));
         const double half = global_costmap_dim_ / 2.0;
 
         nav_msgs::msg::OccupancyGrid og;
-        og.header.stamp = this->get_clock()->now();
+        og.header.stamp = stamp;
         og.header.frame_id = frame_id_;
         og.info.resolution = static_cast<float>(voxel_res_);
         og.info.width  = cells;
@@ -459,32 +451,27 @@ private:
         og.info.origin.position.x = -half;
         og.info.origin.position.y = -half;
         og.info.origin.orientation.w = 1.0;
-        og.data.assign(cells * cells, -1);
+        og.data.assign(static_cast<size_t>(cells) * cells, -1);
 
         auto [depth_lo, depth_hi] = depthBand();
 
-        for (const auto& kv : logodds_grid_) {
-            const VoxelKey& key = kv.first;
+        for (const auto& v : occ) {
+            if (!voxelPassesDepthFilter(v.key, depth_lo, depth_hi)) continue;
 
-            double prob = to_prob(kv.second);
-            if (prob < prob_threshold_) continue;
-            if (!voxelPassesDepthFilter(key, depth_lo, depth_hi)) continue;
-
-            float x_world = key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
-            float y_world = key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            float x_world = v.key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            float y_world = v.key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
 
             int gx = static_cast<int>(std::floor((x_world + half) / voxel_res_));
             int gy = static_cast<int>(std::floor((y_world + half) / voxel_res_));
             if (gx < 0 || gy < 0 || gx >= cells || gy >= cells) continue;
 
-            og.data[gy * cells + gx] = static_cast<int8_t>(std::round(prob * 100.0));
+            og.data[gy * cells + gx] = static_cast<int8_t>(std::round(to_prob(v.logodds) * 100.0));
         }
 
         global_ogm_pub_->publish(og);
     }
 
-    void publishLocalCostmap() {
-        std::lock_guard<std::mutex> lock(map_mutex_);
+    void publishLocalCostmap(const std::vector<OccVoxel>& occ, const rclcpp::Time& stamp) {
         const int cells = static_cast<int>(std::ceil(local_costmap_dim_ / voxel_res_));
         const double half = local_costmap_dim_ / 2.0;
 
@@ -506,7 +493,7 @@ private:
         const double origin_y = std::round((robot_y - half) * 10.0) / 10.0;
 
         nav_msgs::msg::OccupancyGrid og;
-        og.header.stamp = this->get_clock()->now();
+        og.header.stamp = stamp;
         og.header.frame_id = frame_id_;
         og.info.resolution = static_cast<float>(voxel_res_);
         og.info.width  = cells;
@@ -514,25 +501,21 @@ private:
         og.info.origin.position.x = origin_x;
         og.info.origin.position.y = origin_y;
         og.info.origin.orientation.w = 1.0;
-        og.data.assign(cells * cells, -1);
+        og.data.assign(static_cast<size_t>(cells) * cells, -1);
 
         auto [depth_lo, depth_hi] = depthBand();
 
-        for (const auto& kv : logodds_grid_) {
-            const VoxelKey& key = kv.first;
+        for (const auto& v : occ) {
+            if (!voxelPassesDepthFilter(v.key, depth_lo, depth_hi)) continue;
 
-            double prob = to_prob(kv.second);
-            if (prob < prob_threshold_) continue;
-            if (!voxelPassesDepthFilter(key, depth_lo, depth_hi)) continue;
-
-            float x_world = key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
-            float y_world = key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            float x_world = v.key.x * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
+            float y_world = v.key.y * voxel_res_ - half_grid_ + voxel_res_ / 2.0f;
 
             int lx = static_cast<int>(std::floor((x_world - origin_x) / voxel_res_));
             int ly = static_cast<int>(std::floor((y_world - origin_y) / voxel_res_));
             if (lx < 0 || ly < 0 || lx >= cells || ly >= cells) continue;
 
-            og.data[ly * cells + lx] = static_cast<int8_t>(std::round(prob * 100.0));
+            og.data[ly * cells + lx] = static_cast<int8_t>(std::round(to_prob(v.logodds) * 100.0));
         }
 
         local_ogm_pub_->publish(og);
